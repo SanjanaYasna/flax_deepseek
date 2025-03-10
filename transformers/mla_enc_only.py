@@ -27,18 +27,6 @@ from torchvision.datasets import CIFAR100
 
 
 
-
-#traditional formual
-def scaled_dot_product(k, q, v, mask=None): 
-    d_k = k.shape[-1]
-    attn_logits = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(d_k) #q_first_dim, k_last_dim
-    #print("shape of attn_logits", attn_logits.shape)
-    if mask is not None:
-        attn_logits = jnp.where(mask == 0, -9e15, attn_logits)
-    attention = nn.softmax(attn_logits, axis=-1)
-    values = jnp.matmul(attention, v)
-    return values, attention
-
 #assume mask.ndim is minimum of 3
 def expand_mask(mask):
     assert mask.ndim >= 2
@@ -50,29 +38,50 @@ def expand_mask(mask):
         # mask = mask.unsqueeze(0)
     return mask
 
+@nn.nowrap
+#function to apply ROPE on a key or query 
+def rope_emb( key, query, sin_cache, cos_cache, expand_dim = 1):
+    #shape: [num_heads, 1, head_dim], so first and third dimension should match key and query dimensions to broadcast
+    cos_cache = jnp.expand_dims(cos_cache, axis = expand_dim)
+    sin_cache = jnp.expand_dims(sin_cache, axis = expand_dim)
+    assert (sin_cache.shape == cos_cache.shape)
+    #split query and k into two partsn and rotate, with rotational negation of second half
+    query1, query2 = jnp.split(query, 2, axis = -1)
+    #[batch_size, num_heads, seq_len, head_dim]
+    query_rotated = jnp.concatenate([-query2, query1], axis = -1)
+    key1, key2 = jnp.split(key, 2, axis = -1)
+    key_rotated = jnp.concatenate([-key2, key1], axis = -1)
+    #apply embs to query and key splits
+    query_emb = (query * cos_cache) + (query_rotated * sin_cache)
+    key_emb = (key * cos_cache) + (key_rotated* sin_cache)
+    return query_emb, key_emb
+
+
 #reference: https://github.com/VachanVY/Rotary-Embeddings/blob/main/rope.py  
 class PositionalEmbedding:
-    def __init__(self, max_len: int, d_model: int):
-        p, i = jnp.meshgrid(jnp.arange(float(max_len)),jnp.arange(d_model/2) * 2)
+    #(num_heads, embed_dim // num_heads)
+    def __init__(self, seq_len: int, head_dim: int):
+        p, i = jnp.meshgrid(jnp.arange(float(seq_len)),jnp.arange(head_dim/2) * 2)
         #each shape of (d_model / 2, max_len)
-        theta = (p/1e4**(i/d_model)).T  #(d_model/2, max_len)
+        theta = (p/1e4**(i/head_dim)).T  #(d_model/2, max_len)
         self.pos_emb = jnp.stack([
             jnp.sin(theta), jnp.cos(theta)], axis = -1
         ) #shape (max_len, d_model/2, 2)
-        self.pos_emb = self.pos_emb.reshape((max_len, d_model))[None] #(1, max_len, d_model)
+        self.pos_emb = self.pos_emb.reshape((seq_len, head_dim))[None] #(1, max_len, d_model)
     def sin_cos_embs(self):
         return self.pos_emb #(1, max_len, d_model)
     
     def compute_freqs(self):
+        #convert it to shape (1, 1, max_len, d_model)
         sin_freqs = jnp.repeat(self.pos_emb
-            [..., None, ::2], repeats = 2, axis=-1
+            [ ...,  ::2], repeats = 2, axis=-1
         ) # (1, max_len, 1, d_model)
         cos_freqs = jnp.repeat(self.pos_emb
-            [..., None, 1::2], repeats = 2, axis=-1  
+            [...,  1::2], repeats = 2, axis=-1  
                             )
         return sin_freqs, cos_freqs
    
-#my implementation... 
+#my implementation... to go with PositionalEmbeddings as well (NOT USED)
 def apply_rotary_embeddings(q:Array, k:Array, sin_freqs:Array, cos_freqs:Array):
     T = q.shape[1]
     #shape (batch_dim, num_heads, d_model, d_model / num_heads)
@@ -81,6 +90,7 @@ def apply_rotary_embeddings(q:Array, k:Array, sin_freqs:Array, cos_freqs:Array):
     k = k*cos_freqs[:, :T, :, :] + minus_swap_alternate(k)*sin_freqs[:, :T, :, :] # (B, T, h, dq)*(1, T, 1, dq) + (B, T, h, dq)*(1, T, 1, dq)
     return q, k # (B, T, h, dq), (B, T, h, dq)
 
+#NOT USED either
 #try RoPE precomputed embedding implementation as helper, no state management wrapper 
 #compute sin and cos for each position 
 @nn.nowrap
@@ -103,6 +113,10 @@ def precompute_sin_cos_exp_caches(max_len, d_model):
     sin_cache = jnp.sin(idx_concat)
     return sin_cache, cos_cache
 
+
+
+
+#multi head latent attention
 @nn.nowrap
 #function to apply ROPE on a key or query 
 def rope_emb( key, query, sin_cache, cos_cache, expand_dim = 1):
@@ -116,31 +130,35 @@ def rope_emb( key, query, sin_cache, cos_cache, expand_dim = 1):
     query_rotated = jnp.concatenate([-query2, query1], axis = -1)
     key1, key2 = jnp.split(key, 2, axis = -1)
     key_rotated = jnp.concatenate([-key2, key1], axis = -1)
-    
+    print("cos_cache shape", cos_cache.shape)
+    print("query shape", query_rotated.shape)
+    print("key shape", key_rotated.shape)
     #apply embs to query and key splits
     query_emb = (query * cos_cache) + (query_rotated * sin_cache)
     key_emb = (key * cos_cache) + (key_rotated* sin_cache)
     return query_emb, key_emb
-
-
-#multi head latent attention
+    
 class MLA(nn.Module):
     num_heads: int
+    num_kv_heads : int 
+    #kv_head_dim: int
     embed_dim: int
     
     def setup(self):
         self.head_dim = self.embed_dim // self.num_heads #since should naturally project below onto oringal embed_dim
+        #query will be grouped by num_kv_heads, while K and V split by num_kv_heads
+        self.kv_head_dim = self.head_dim 
         self.query_proj = nn.Dense(
             self.num_heads * self.head_dim,
             kernel_init = nn.initializers.xavier_uniform()
         )
         self.key_proj = nn.Dense(
             #normally would project ot a reduced number of key-value heads..
-            self.num_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
             kernel_init = nn.initializers.xavier_uniform()
         )
         self.value_proj = nn.Dense(
-            self.num_heads * self.head_dim,
+            self.num_kv_heads * self.head_dim,
             kernel_init=nn.initializers.xavier_uniform()
         )
     
@@ -160,56 +178,59 @@ class MLA(nn.Module):
             #mask min 3 dims
             mask = expand_mask(mask) 
             
-        #up projection
-        #shape [batch_size, seq_length, num_heads*head_dim]
-        query_state = self.query_proj(x)
-        key_state = self.key_proj(x)
-        value_state = self.value_proj(x)
+        #shape [batch_size, seq_length, projection dimension ]
+        query_state = self.query_proj(x) #(..., num_heads * head_dim)
+        key_state = self.key_proj(x) #(..., num_kv_heads * head_dim)
+        value_state = self.value_proj(x) #(..., num_kv_heads * head_dim)
         
-        #[batch_size, seq_length, num_heads*head_dim] ->
-        #[batch_size, seq_length, num_heads, head_dim] ->
-        #[batch_size, num_heads, seq_length, head_dim]
+        #(batch_size, num_heads, seq_len, head_dim)
         query_state = query_state.reshape(
-            batch_size, seq_length, self.num_heads, -1
-        ).transpose(0, 2, 1, 3)
-        key_state = key_state.reshape(
-            batch_size, seq_length, self.num_heads, -1
-        ).transpose(0, 2, 1, 3)
-        value_state = value_state.reshape(
-            batch_size, seq_length, self.num_heads, -1
-        ).transpose(0, 2, 1, 3)
+            batch_size, seq_length, self.num_heads, self.kv_head_dim).transpose(0, 2, 1, 3)
         
-        #applied rope embeddings (shape maintained)
-        #TODO Change rotary emb function if needed
-        query_state, key_state = apply_rotary_embeddings(query_state, 
-                                        key_state, 
+        #(batch_size, num_kv_heads, seq_len, head_dim) 
+        key_state = key_state.reshape(
+            batch_size, -1, self.num_kv_heads, self.kv_head_dim).transpose(0, 2, 1, 3) 
+        #(batch_size, num_kv_heads, seq_len, head_dim)
+        value_state = value_state.reshape(
+            batch_size, -1, self.num_kv_heads, self.kv_head_dim).transpose(0, 2, 1, 3)
+
+        query_state, key_state = rope_emb(key_state, 
+                                        query_state, 
                                         sin, 
                                         cos)
+        #k repeated to have same dim as q 
+        key_state = jnp.repeat(key_state, self.num_heads // self.num_kv_heads, axis = 1)
+
         
-        #scaled dot product attention with mask
-        values, attention = scaled_dot_product(key_state, query_state, value_state, mask)
+        attn_output = jnp.matmul(query_state, jnp.swapaxes(key_state, -1, -2)) / jnp.sqrt(self.head_dim)
+        if mask is not None:
+            causal_mask = mask[:, :, :, :,key_state.shape[-2]]
+            attn_output = causal_mask + attn_output
         
-        #softmax to get attention probabilities [batch_size, num_heads, seq_length, head_dim / 2]
-        attention_weights = nn.softmax(attention, axis = -1)
-        #dot product of weights with values
-        attn_output = jnp.matmul(attention_weights, values)
-        #reshape output, compress last two dimensions for each head
-        #-> [batch_size, num_heads, embed_dim]
+        #modification: can upcast to fp32 here and then downcast to query dtype if run with fp8
+        attention_weights = nn.softmax(attn_output, axis = -1)
+        
+        #now repeat value states
+        value_state = jnp.repeat(value_state, self.num_heads // self.num_kv_heads, axis = 1)
+        
+        #multiply with value
+        attn_output = jnp.matmul(attention_weights, value_state)
+        #reshape back to x
         attn_output = attn_output.transpose(0, 2, 1, 3)
         attn_output = attn_output.reshape(batch_size, seq_length, embed_dim)
-        #attn_output proj back to original shape of x: [batch_size, seq_length, embed_dim]
-        #attention_weights maintains k q v state shapes: [batch_size, num_heads, seq_length, head_dim ]
-        return self.o_proj(attn_output), attention_weights
+        
+        return self.o_proj(attn_output)
     
-
 class MLAEncoderBlock(nn.Module): 
     input_dim : int #determines out dim of mha too
     num_heads : int
+    num_kv_heads : int 
     dim_feedforward : int
     dropout_rate : float = 0.0 
     
     def setup(self): 
-        self.mla = MLA(self.num_heads, self.input_dim) 
+        self.mla = MLA(num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                    embed_dim=self.input_dim) 
         #MLP
         self.linear = [
             nn.Dense(self.dim_feedforward),
@@ -225,7 +246,7 @@ class MLAEncoderBlock(nn.Module):
     
     def __call__(self, x, sin, cos, 
                 mask=None, deterministic = False):
-        attn_, _ =self.mla(x,  sin, cos, mask)
+        attn_ =self.mla(x,  sin, cos, mask)
 
         #add & norm after mha. Dropout applies during train 
         
@@ -247,6 +268,7 @@ class MLATransformerEncoder(nn.Module):
     num_layers : int #num encoder layers in Encoder block
     input_dim : int #determines out dim of mha too
     num_heads : int
+    num_kv_heads : int 
     dim_feedforward : int
     dropout_rate : float = 0.0
     
@@ -256,12 +278,13 @@ class MLATransformerEncoder(nn.Module):
             input_dim = self.input_dim, 
             num_heads = self.num_heads, 
             dim_feedforward = self.dim_feedforward,
-            dropout_rate = self.dropout_rate
+            dropout_rate = self.dropout_rate,
+            num_kv_heads=self.num_kv_heads
         )
         for i in range(self.num_layers)]
         #pass dynamic deterministic variable as call argument
     def __call__(self, x, 
-                sin, #precomputed from precompute_sin_cos_exp_caches()
+                sin, 
                 cos, 
                 mask=None, deterministic = False):
         for layer in self.layers:
@@ -272,8 +295,9 @@ class MLATransformerEncoder(nn.Module):
 
 #encoder-only full model with multi-head latent attention
 class MLATransformer(nn.Module): 
-    model_dim : int
-    num_heads : int
+    model_dim : int 
+    num_heads : int #should evenly go into model_dim
+    num_kv_heads : int #should evenly go into num_heads
     num_classes : int
     num_layers : int
     dropout_rate : float = 0.0
@@ -289,7 +313,8 @@ class MLATransformer(nn.Module):
             input_dim = self.model_dim,
             num_heads = self.num_heads,
             dim_feedforward = 2 * self.model_dim,
-            dropout_rate = self.dropout_rate
+            dropout_rate = self.dropout_rate,
+            num_kv_heads=self.num_kv_heads
         )
         
         #mlp output (no decoder for now)
@@ -314,4 +339,25 @@ class MLATransformer(nn.Module):
         for l in self.out:
             x = l(x, deterministic = not train) if isinstance(l, nn.Dropout) else l(x)
         return x
+    
 
+#EXAMPLE ONE OFF RUN MLATransformer
+# main_rng, x_rng = random.split(main_rng)
+# x = random.normal(x_rng, (3, 16, 64))
+# mask = jax.random.bernoulli(main_rng, p=0.5, shape=(3, 8, 16, 16, 16))
+# #num heads must be divisible by num_kv_heads
+# mlatrans = MLATransformer(num_layers=5,
+#                                 model_dim=128,
+#                                 num_classes=10,
+#                                 num_heads=8,
+#                                 num_kv_heads=4,
+#                                 dropout_rate=0.15,
+#                                 init_dropout_rate=0.05)
+# main_rng, init_rng, dropout_init_rng = random.split(main_rng, 3)
+# params = mlatrans.init({'params': init_rng, 'dropout': dropout_init_rng}, x, sin, cos, mask = mask, train=True)['params']
+# # Apply transformer predictor with parameters on the inputs
+# # Since dropout is stochastic, we need to pass a rng to the forward
+# main_rng, dropout_apply_rng = random.split(main_rng)
+# # Instead of passing params and rngs every time to a function call, we can bind them to the module
+# binded_mod = mlatrans.bind({'params': params}, rngs={'dropout': dropout_apply_rng})
+# out = binded_mod(x, sin, cos, mask, train=True)
